@@ -1,11 +1,10 @@
-"""
-Implementation of barycentric interpolation of a function approximated using 
-a Lagrange polynomial basis constrained at Chebyshev collocation nodes. 
-"""
 import numpy as np 
 
 class BarycentricInterpolation:
-
+    """
+    Implementation of barycentric interpolation of a function approximated using 
+    a Lagrange polynomial basis constrained at Chebyshev collocation nodes. 
+    """
     def __init__(self, start_time, end_time, num_nodes):
         self.start_time = start_time
         self.end_time = end_time

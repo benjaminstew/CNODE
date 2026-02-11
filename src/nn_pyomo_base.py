@@ -1,17 +1,16 @@
-'''
-Implementation of a base optimisation model to train collocation-based Neural ODEs using Pyomo and the IPOPT solver. 
-I have tried to make the code as scalable as possible with NN size etc., but there are still may improvements to be made.
-'''
 # currently lacks customisation on the numerical analysis methods used, ML architecture used, param initialisation methods, etc...
 import warnings
 import numpy as np 
 from scipy.integrate import solve_ivp
 import pyomo.environ as pyo
 from pyomo.opt import SolverStatus, TerminationCondition
-from interpolation import BarycentricInterpolation
+from .interpolation import BarycentricInterpolation
 
 class NeuralODEPyomo:
-
+    """
+    Implementation of a base optimisation model to train collocation-based Neural ODEs using Pyomo and the IPOPT solver. 
+    I have tried to make the code as scalable as possible with NN size etc., but there are still may improvements to be made.
+    """
     def __init__(self, 
             Y_obs, T, D, layer_sizes,   
             state_lower_bound, state_upper_bound, 
