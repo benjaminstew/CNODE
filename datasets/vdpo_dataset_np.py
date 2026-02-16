@@ -1,6 +1,6 @@
 import numpy as np
 from scipy.integrate import solve_ivp
-from src.interpolation import BarycentricInterpolation
+from CNODE.src.direct_collocation import BarycentricInterpolation
 
 class VanDerPolOscillator:
     """
@@ -9,20 +9,23 @@ class VanDerPolOscillator:
     a system with nonlinear damping of degree μ. 
     If μ = 0 the system is linear and undamped, and we have a simple harmonic oscillator.
     """
-    def __init__(self, mu=1.0, external_force=1.0, angular_freq=1.0, u_0=0.0, v_0=1.0):
+    def __init__(self, mu=1.0, external_force=1.0, angular_freq=1.0, u_0=0.0, v_0=1.0, time_invariant=False):
         self.mu = mu # nonlinearity/damping parameter
         self.external_force = external_force # external periodic force parameter
         self.angular_freq = angular_freq
         self.u_0 = u_0 # initial displacement
         self.v_0 = v_0 # initial velocity
-        self.state_dim = 2
+        self.time_invariant = time_invariant
 
     def get_initial_state(self):
         '''
         Returns the initial state vector of shape (2, ) containing the
         initial displacement (u_0) and initial velocity (v_0).
         '''
-        return np.array([self.u_0, self.v_0], dtype=np.float32)
+        if self.time_invariant:
+            return np.array([self.u_0, self.v_0], dtype=np.float32)
+        else:
+            return np.array([self.u_0, self.v_0, 0], dtype=np.float32)
 
     def get_dynamics(self, t, y):
         '''
@@ -32,9 +35,12 @@ class VanDerPolOscillator:
         v = y[1]
         dudt = v
         dvdt = self.mu * (1 - u**2) * v - u + self.external_force * np.cos(self.angular_freq * t)
-        return np.array([dudt, dvdt], dtype=np.float32)
+        if self.time_invariant:
+            return np.array([dudt, dvdt], dtype=np.float32)
+        else:
+            return np.array([dudt, dvdt, t], dtype=np.float32)
     
-def create_vdpo_dataset(num_nodes, end_time, noise_sd, add_noise=True): 
+def create_vdpo_dataset(num_nodes, end_time, noise_sd, add_noise=True, time_invariant=False): 
     '''
     Computes single trajectory of VDPO state over [0, end_time] and splits into 50/50 train set and test set.
     
@@ -51,7 +57,7 @@ def create_vdpo_dataset(num_nodes, end_time, noise_sd, add_noise=True):
     half_time = end_time // 2
 
     #1. Create the system 
-    system = VanDerPolOscillator()
+    system = VanDerPolOscillator(time_invariant=time_invariant)
 
     #2. Build train and test grids 
     train_interp = BarycentricInterpolation(0, half_time, half_nodes)
@@ -69,15 +75,15 @@ def create_vdpo_dataset(num_nodes, end_time, noise_sd, add_noise=True):
         t_eval=full_grid,
         method='RK45'
     )
-    full_trajectory = solution.y.T  # (num_nodes, 2)
+    full_trajectory = solution.y.T  # (num_nodes, state_dim)
     smooth_trajectory = full_trajectory.copy()
 
     #4. Extract train/test rows by matching grid values
     train_idx = np.isin(full_grid, train_grid)
     test_idx  = np.isin(full_grid, test_grid)
-    train_trajectory = full_trajectory[train_idx, :] # (half_nodes, 2)
+    train_trajectory = full_trajectory[train_idx, :] # (half_nodes, state_dim)
     train_trajectory_smooth = smooth_trajectory[train_idx, :]
-    test_trajectory = full_trajectory[test_idx, :] # (half_nodes, 2)
+    test_trajectory = full_trajectory[test_idx, :] # (half_nodes, state_dim)
 
     #5. Add Gaussian noise to training data only
     if add_noise and noise_sd is not None and noise_sd > 0:

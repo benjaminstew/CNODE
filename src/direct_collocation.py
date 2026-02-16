@@ -2,8 +2,8 @@ import numpy as np
 
 class BarycentricInterpolation:
     """
-    Implementation of barycentric interpolation of a function approximated using 
-    a Lagrange polynomial basis constrained at Chebyshev collocation nodes. 
+    Implementation of barycentric interpolation of Lagrange polynomials, when they are used as a basis for a direct collocation 
+    approximation of the solution to an ODE. Uses Chebyshev collocation nodes of the second kind.
     """
     def __init__(self, start_time, end_time, num_nodes):
         self.start_time = start_time
@@ -12,9 +12,7 @@ class BarycentricInterpolation:
         self.collocation_grid = self.generate_chebyshev_nodes_second_kind()
     
     def generate_chebyshev_nodes_second_kind(self):
-        '''
-        Generates self.num_nodes Chebyshev nodes of the second kind in the interval [self.start_time, self.end_time].
-        '''
+        '''Returns a sorted array of self.num_nodes Chebyshev nodes of the second kind in the interval [self.start_time, self.end_time].'''
         i = np.arange(0, self.num_nodes, step=1, dtype=np.float32) # n equispaced nodes 0 -> n-1
         nodes = np.cos(i * np.pi / (self.num_nodes - 1)) # descending order 1 -> -1 as i ascends 0 -> n-1 
         nodes = 0.5 * (self.end_time - self.start_time) * nodes + 0.5 * (self.start_time + self.end_time) # scale nodes from [-1, 1] to [st, et]
@@ -37,7 +35,7 @@ class BarycentricInterpolation:
 
     def compute_derivative_matrix(self):
         '''
-        Compute the derivative matrix for the approximated function. 
+        Returns the Jacobian of the approximated ODE solution as ndarray. 
         Formula taken from original paper https://arxiv.org/pdf/2502.15642. 
         '''
         D = np.zeros((self.num_nodes, self.num_nodes), dtype=np.float32)

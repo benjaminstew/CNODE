@@ -4,7 +4,7 @@ import numpy as np
 from scipy.integrate import solve_ivp
 import pyomo.environ as pyo
 from pyomo.opt import SolverStatus, TerminationCondition
-from .interpolation import BarycentricInterpolation
+from .direct_collocation import BarycentricInterpolation
 
 class NeuralODEPyomo:
     """
@@ -12,7 +12,7 @@ class NeuralODEPyomo:
     I have tried to make the code as scalable as possible with NN size etc., but there are still may improvements to be made.
     """
     def __init__(self, 
-            Y_obs, T, D, layer_sizes,   
+            Y_obs, D, layer_sizes,   
             state_lower_bound, state_upper_bound, 
             param_lower_bound, param_upper_bound,
             lambda_reg, 
@@ -22,7 +22,6 @@ class NeuralODEPyomo:
         self.num_nodes, self.state_dim = self.Y_obs.shape
         if self.state_dim > self.num_nodes:
             warnings.warn("Y_obs should be structured such that each row represents a new collocation point.")
-        self.T = T # endpoint of training trajectory [0, T]
         self.D = D # collocation-estimated differentiation matrix. ndarray (num_nodes, num_nodes)
         self.layer_sizes = layer_sizes
         self.model = pyo.ConcreteModel()
@@ -33,6 +32,7 @@ class NeuralODEPyomo:
         self.lambda_reg = lambda_reg # regularisation hyperparameter for loss function 
         self.Y_smooth = Y_smooth if Y_smooth is not None else Y_obs # noise-free trajectory for Y_star init
         self.build_model()
+
 
     # ------------------------------ MODEL BUILDING METHODS ------------------------------- #
 
@@ -57,7 +57,7 @@ class NeuralODEPyomo:
         return init_rule
     
     def initialise_Y_star(self):
-        '''Initialisation of the approximate state trajectory Y_star as a pyomo Var using LOWESS-smoothed data.'''
+        '''Initialisation of the approximate state trajectory Y_star as a pyomo Var using smooth data.'''
         def init_rule(model, n, d):
             return self.Y_smooth[n-1, d-1] # self.Y_smooth is a 0-indexed ndarray
         return init_rule
@@ -188,7 +188,7 @@ class NeuralODEPyomo:
         return activations[-1]
     
     def freeze_vars(self):
-        '''Fix values of all pyomo vars in model'''
+        '''Fix values of vars in pyomo model'''
         self.model.Y_star.fix() 
         for l in self.model.l:
             self.model.Ws[l].W.fix()
@@ -196,9 +196,11 @@ class NeuralODEPyomo:
 
     def solve_model(self):
         '''Solve the Pyomo optimisation model using IPOPT solver. Returns the solver result object.'''
+
         solver = pyo.SolverFactory("ipopt", executable="/opt/homebrew/bin/ipopt")
         print("Solver available?: {}".format(solver.available())) 
-        print("\nInitial NN parameter summary stats (pre-IPOPT): {}".format(self.check_param_values()))
+        print("\nInitial NN parameter summary stats (pre-IPOPT): ")
+        self.check_param_values()
 
         solver.options['max_iter'] = 3000
         solver.options['tol'] = 1e-6 
@@ -213,7 +215,8 @@ class NeuralODEPyomo:
             print("Solution is feasible and optimal")
             self.freeze_vars()
             print("NN parameters have been frozen")
-            print("\nFinal NN parameter summary stats (post-IPOPT): {}".format(self.check_param_values()))
+            print("\nFinal NN parameter summary stats (post-IPOPT): ")
+            self.check_param_values()
         else:
             print("Solution is not feasible and/or not optimal: {}".format(str(result.solver)))
 
@@ -222,12 +225,9 @@ class NeuralODEPyomo:
 
     # ------------------------------ DIAGNOSTIC METHODS --------------------------------------- #
 
-    def check_ode_residuals(self, t_grid=None):
-        '''
-        Check how well the NN satisfies the ODE at collocation points.
-        Enforces the ODE constraint only for nodes 2 -> N (node 1 is reserved for the initial condition).
-        This is all from Claude lol
-        ''' 
+    def check_ode_residuals(self):
+        '''Print and return residual error between NN prediction and ODE at collocation points.''' 
+
         Y_star = self.pyomo_var_to_numpy(self.model.Y_star, (self.num_nodes, self.state_dim))
         Ws = self.convert_weights()
         bs = self.convert_biases()
@@ -242,31 +242,27 @@ class NeuralODEPyomo:
         # calc residual 
         residual = lhs - rhs
 
+        # summary stats for all nodes 
         abs_res = np.abs(residual)
         all_max = abs_res.max()
         all_mean = abs_res.mean()
 
-        # Constrained nodes are Pyomo indices 2 -> N 
+        # summary stats for constrained nodes (pyomo indices 2 -> N)
         constrained = abs_res[1:, :]
         cons_max = constrained.max() if constrained.size else float('nan')
         cons_mean = constrained.mean() if constrained.size else float('nan')
 
-        # Where is the worst constrained violation?
+        # where is the worst constrained violation?
         worst_flat = int(np.argmax(constrained)) 
         worst_row, worst_dim = np.unravel_index(worst_flat, constrained.shape) 
         worst_n = worst_row + 2 # convert back to Pyomo indexing for reporting
 
+        # print summary stats
         print(f"ODE residual (all nodes) max: {all_max:.6f}")
         print(f"ODE residual (all nodes) mean: {all_mean:.6f}")
         print(f"ODE residual (constrained nodes 2 -> N) max: {cons_max:.6f}")
         print(f"ODE residual (constrained nodes 2 -> N) mean: {cons_mean:.6f}")
         msg = f"Worst constrained node: n={worst_n}, dim={worst_dim+1}, |res|={constrained[worst_row, worst_dim]:.6f}"
-        if t_grid is not None:
-            try:
-                t_val = float(t_grid[worst_n - 1])
-                msg += f", t={t_val:.6f}"
-            except Exception:
-                pass
         print(msg)
 
         return residual
@@ -279,10 +275,11 @@ class NeuralODEPyomo:
             print(f"Layer {l}: W range [{W.min():.4f}, {W.max():.4f}], |W| mean {np.abs(W).mean():.4f}")
             print(f"Layer {l}: b range [{b.min():.4f}, {b.max():.4f}], |b| mean {np.abs(b).mean():.4f}")
 
-    # ---------------------------- PREDICTION/IVP METHODS ------------------------------------ #
+
+    # ---------------------------- PREDICTION/IVP SOLVE METHODS -------------------------------- #
 
     def pyomo_var_to_numpy(self, pyo_obj, shape): 
-        '''Copy a Pyomo Var/Param into a numpy ndarray.'''
+        '''Copy pyo_obj (a Pyomo Var/Param) into a numpy ndarray.'''
         return np.array([[pyo.value(pyo_obj[i, j]) for j in range(1, shape[1]+1)] for i in range(1, shape[0]+1)])
     
     def convert_weights(self):
@@ -301,9 +298,7 @@ class NeuralODEPyomo:
         return out.flatten()  # return 1D array for solve_ivp
 
     def get_predicted_trajectory(
-        self,
-        y_0,
-        t_grid,
+        self, y_0, t_grid,
         method: str='RK45',
         rtol: float= 1e-3,
         atol: float= 1e-6,
@@ -351,10 +346,7 @@ class NeuralODEPyomo:
         )
 
         if not predicted_trajectory.success:
-            raise RuntimeError(
-                "solve_ivp failed: "
-                f"status={predicted_trajectory.status}, message={predicted_trajectory.message}"
-            )
+            raise RuntimeError("solve_ivp failed: " f"status={predicted_trajectory.status}, message={predicted_trajectory.message}")
 
         return predicted_trajectory.y.T
 
