@@ -4,11 +4,10 @@ import numpy as np
 from scipy.integrate import solve_ivp
 import pyomo.environ as pyo
 from pyomo.opt import SolverStatus, TerminationCondition
-from .direct_collocation import BarycentricInterpolation
 
 class NeuralODEPyomo:
     """
-    Implementation of a base optimisation model to train collocation-based Neural ODEs using Pyomo and the IPOPT solver. 
+    Implementation of a base optimisation model to train direct collocation-based Neural ODEs using Pyomo and the IPOPT solver. 
     I have tried to make the code as scalable as possible with NN size etc., but there are still may improvements to be made.
     """
     def __init__(self, 
@@ -16,12 +15,16 @@ class NeuralODEPyomo:
             state_lower_bound, state_upper_bound, 
             param_lower_bound, param_upper_bound,
             lambda_reg, 
-            Y_smooth=None
+            Y_smooth=None, 
+            transcription_method='dc', 
+            rho_reg=None, 
+            quadrature_weights=None
     ):
         self.Y_obs = Y_obs # observed state trajectory from measurements. ndarray (num_nodes, state_dim)
         self.num_nodes, self.state_dim = self.Y_obs.shape
         if self.state_dim > self.num_nodes:
             warnings.warn("Y_obs should be structured such that each row represents a new collocation point.")
+
         self.D = D # collocation-estimated differentiation matrix. ndarray (num_nodes, num_nodes)
         self.layer_sizes = layer_sizes
         self.model = pyo.ConcreteModel()
@@ -31,8 +34,15 @@ class NeuralODEPyomo:
         self.param_upper_bound = param_upper_bound
         self.lambda_reg = lambda_reg # regularisation hyperparameter for loss function 
         self.Y_smooth = Y_smooth if Y_smooth is not None else Y_obs # noise-free trajectory for Y_star init
-        self.build_model()
 
+        self.transcription_method = transcription_method
+        if self.transcription_method == 'irrdc': 
+            if rho_reg is None or quadrature_weights is None:
+                raise ValueError("Need to set hyperparameters rho_reg and quadrature_weights for IRRDC method.")
+            self.rho_reg = rho_reg
+            self.quadrature_weights = quadrature_weights
+        
+        self.build_model()
 
     # ------------------------------ MODEL BUILDING METHODS ------------------------------- #
 
@@ -51,7 +61,7 @@ class NeuralODEPyomo:
         return init_rule
     
     def initialise_diff_matrix(self):
-        '''Initialisation of collocation-estimated differentiation matrix as a pyomo Param.'''
+        '''Initialisation of collocation-estimated Jacobian matrix as a pyomo Param.'''
         def init_rule(model, n, n_prime):
             return self.D[n-1, n_prime-1] # self.D is a 0-indexed ndarray
         return init_rule
@@ -62,19 +72,20 @@ class NeuralODEPyomo:
             return self.Y_smooth[n-1, d-1] # self.Y_smooth is a 0-indexed ndarray
         return init_rule
     
-    def reg_mse_objective_rule(self, model):
+    def objective_rule(self, model, nn_output):
         '''
-        Returns the objective function - the regularised MSE
-        between approximate (model.Y_star) and observed (self.Y_obs) trajectories - as a pyomo expression.
+        Returns the objective function -- the regularised MSE between approximate (model.Y_star) 
+        and observed (self.Y_obs) trajectories for DC, with an optional integrated residual penalty term for IRR-DC -- as a pyomo expression.
         Take model as input so can use as pyo.Objective rule.
         '''
-        # MSE term: (1/N)||Y_star - Y_obs||_F^2
+        # MSE term: (1/N) * ||Y_star - Y_obs||_F^2
         mse = (1 / self.num_nodes) * sum(
             (model.Y_star[n, d] - self.Y_obs[n-1, d-1])**2
             for n in model.n 
             for d in model.d
         ) 
-        # Regularised L2 norm term: lambda||theta||_2^2
+
+        # Regularised L2 norm term: lambda * ||theta||_2^2
         l2_norm = sum(
             model.Ws[l].W[i, j]**2
             for l in model.l
@@ -85,7 +96,17 @@ class NeuralODEPyomo:
             for l in model.l
             for j in range(1, self.layer_sizes[l] + 1)
         )
+
         reg_l2_norm = self.lambda_reg * l2_norm
+
+        # IRRDC penalty term: (1/rho) * sum_n(w_n * ||ode_lhs_n - nn_output_n||_2^2)
+        if self.transcription_method == 'irrdc':
+            residual_penalty = (1 / (2 * self.rho_reg)) * sum(
+                self.quadrature_weights[n-1] * (self.model.ode_lhs[n, d] - nn_output[n-1, d-1])**2
+                for n in model.n
+                for d in model.d
+            )
+            return mse + reg_l2_norm + residual_penalty
 
         return mse + reg_l2_norm
 
@@ -104,6 +125,10 @@ class NeuralODEPyomo:
             initialize=self.initialise_Y_star(),  
             bounds=(self.state_lower_bound, self.state_upper_bound)
         )
+        print(f"Y_star variable average: {np.mean([pyo.value(self.model.Y_star[n, d]) for n in self.model.n for d in self.model.d]):.4f}, ")
+        print(f"Y_star variable range: [{min(pyo.value(self.model.Y_star[n, d]) for n in self.model.n for d in self.model.d):.4f}, {max(pyo.value(self.model.Y_star[n, d]) for n in self.model.n for d in self.model.d):.4f}]")
+        print(f"Initial MSE: {np.mean([(pyo.value(self.model.Y_star[n, d]) - self.Y_obs[n-1, d-1])**2 for n in self.model.n for d in self.model.d]):.4f}")
+        
         # Initialise NN parameters
         self.model.Ws = pyo.Block(self.model.l) 
         self.model.bs = pyo.Block(self.model.l) 
@@ -122,9 +147,8 @@ class NeuralODEPyomo:
                 initialize=self.initialise_bias((1, self.layer_sizes[l])),
                 bounds=(self.param_lower_bound, self.param_upper_bound)
             )
-
-        # -- INITIAL CONDITION CONSTRAINT --
-        # Force initial state in Y_star to equal initial state in Y_obs
+        print(F"Initial regularised l2 norm: {self.lambda_reg * sum(pyo.value(self.model.Ws[l].W[i, j])**2 for l in self.model.l for i in range(1, self.layer_sizes[l-1] + 1) for j in range(1, self.layer_sizes[l] + 1)) + self.lambda_reg * sum(pyo.value(self.model.bs[l].b[1, j])**2 for l in self.model.l for j in range(1, self.layer_sizes[l] + 1)):.4f}")
+        
         self.model.initial_condition = pyo.ConstraintList()
         for d in self.model.d:
             self.model.initial_condition.add(self.model.Y_star[1, d] == self.Y_obs[0, d-1])
@@ -137,22 +161,25 @@ class NeuralODEPyomo:
             domain=pyo.Reals, 
             initialize=self.initialise_diff_matrix()
         )
+
         # Define LHS of ODE (dY_star/dt) as matrix of pyomo expressions 
         self.model.ode_lhs = pyo.Expression( 
             self.model.n, 
             self.model.d, 
             rule=lambda model, n, d: sum(self.model.Y_star[j, d] * self.model.D[n, j] for j in model.n) 
         )
+
         # Compute output of NN as a ndarray of Pyomo expressions 
-        nn_output = self.nn_feedforward_pyo() 
-        # Define ODE constraint: dY_star/dt == NN(Y_star) 
+        nn_output = self.nn_feedforward_pyo()
+
+        # Define ODE constraint: dY_star/dt = NN(Y_star)
         self.model.ode = pyo.ConstraintList()
         for n in range(2, self.num_nodes + 1): # skip n=1 (initial condition already enforced)
             for d in self.model.d:
                 self.model.ode.add(self.model.ode_lhs[n, d] == nn_output[n-1, d-1])
-   
+
         # ------------ OBJECTIVE -----------
-        self.model.obj = pyo.Objective(rule=self.reg_mse_objective_rule, sense=pyo.minimize)
+        self.model.obj = pyo.Objective(rule=lambda m: self.objective_rule(m, nn_output), sense=pyo.minimize)
 
 
     # ----------------------------------- TRAINING METHODS ----------------------------------- #
@@ -223,49 +250,7 @@ class NeuralODEPyomo:
         return result
     
 
-    # ------------------------------ DIAGNOSTIC METHODS --------------------------------------- #
-
-    def check_ode_residuals(self):
-        '''Print and return residual error between NN prediction and ODE at collocation points.''' 
-
-        Y_star = self.pyomo_var_to_numpy(self.model.Y_star, (self.num_nodes, self.state_dim))
-        Ws = self.convert_weights()
-        bs = self.convert_biases()
-        
-        # ODE LHS: D . Y_star 
-        D_np = self.pyomo_var_to_numpy(self.model.D, (self.num_nodes, self.num_nodes))
-        lhs = np.dot(D_np, Y_star) 
-        # ODE RHS: NN(Y_star) 
-        rhs = np.zeros_like(lhs)
-        for n in range(self.num_nodes):
-            rhs[n, :] = self.nn_prediction(0, Y_star[n, :], Ws, bs)
-        # calc residual 
-        residual = lhs - rhs
-
-        # summary stats for all nodes 
-        abs_res = np.abs(residual)
-        all_max = abs_res.max()
-        all_mean = abs_res.mean()
-
-        # summary stats for constrained nodes (pyomo indices 2 -> N)
-        constrained = abs_res[1:, :]
-        cons_max = constrained.max() if constrained.size else float('nan')
-        cons_mean = constrained.mean() if constrained.size else float('nan')
-
-        # where is the worst constrained violation?
-        worst_flat = int(np.argmax(constrained)) 
-        worst_row, worst_dim = np.unravel_index(worst_flat, constrained.shape) 
-        worst_n = worst_row + 2 # convert back to Pyomo indexing for reporting
-
-        # print summary stats
-        print(f"ODE residual (all nodes) max: {all_max:.6f}")
-        print(f"ODE residual (all nodes) mean: {all_mean:.6f}")
-        print(f"ODE residual (constrained nodes 2 -> N) max: {cons_max:.6f}")
-        print(f"ODE residual (constrained nodes 2 -> N) mean: {cons_mean:.6f}")
-        msg = f"Worst constrained node: n={worst_n}, dim={worst_dim+1}, |res|={constrained[worst_row, worst_dim]:.6f}"
-        print(msg)
-
-        return residual
+    # ------------------------------ DIAGNOSTIC METHODS ---------------------------------------- #
     
     def check_param_values(self):
         '''Print summary statistics for NN parameters.'''
@@ -289,27 +274,27 @@ class NeuralODEPyomo:
         return [self.pyomo_var_to_numpy(self.model.bs[l].b, (1, self.layer_sizes[l])) for l in self.model.l]
     
     def nn_prediction(self, t, y_0, Ws, bs): 
-        y_0 = y_0.reshape(1, -1)  # reshape to row vector
-        out = np.tanh(np.dot(y_0, Ws[0]) + bs[0])  # first hidden layer
+        y_0 = y_0.reshape(1, -1) # reshape to row vector
+        out = np.tanh(np.dot(y_0, Ws[0]) + bs[0]) # first hidden layer
         for W, b in zip(Ws[1:-1], bs[1:-1]): 
-            out = np.tanh(np.dot(out, W) + b)  # calc activation for hidden layer, move forward
-        out = np.dot(out, Ws[-1]) + bs[-1]  # linear output layer
+            out = np.tanh(np.dot(out, W) + b) # calc activation for hidden layer, move forward
+        out = np.dot(out, Ws[-1]) + bs[-1] # linear output layer
         
-        return out.flatten()  # return 1D array for solve_ivp
+        return out.flatten() # return 1D array for solve_ivp
 
-    def get_predicted_trajectory(
-        self, y_0, t_grid,
-        method: str='RK45',
-        rtol: float= 1e-3,
-        atol: float= 1e-6,
-        max_step: float= np.inf
+    def get_predicted_trajectory(self, 
+            y_0, t_grid,
+            method: str='RK45',
+            rtol: float= 1e-3,
+            atol: float= 1e-6,
+            max_step: float= np.inf
     ):
         '''
         Predict state trajectory over t_grid via forward integration of the trained NN using scipy.solve_ivp.
 
         Args:
             y_0: Initial state, ndarray (state_dim,). Must be 1D for scipy.solve_ivp.
-            t_grid: Strictly increasing time grid, ndarray (num_nodes,).
+            t_grid: Strictly increasing time grid, ndarray (num_nodes, ).
             method: solve_ivp method (e.g. 'RK45', 'DOP853', 'Radau', 'BDF').
             rtol, atol, max_step: solve_ivp tolerances/step control.
 
