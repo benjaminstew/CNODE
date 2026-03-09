@@ -25,7 +25,7 @@ class VanDerPolOscillator:
         return np.array([self.u_0, self.v_0], dtype=np.float32)
 
     def get_dynamics(self, t, y):
-        '''The sequential solver calls this method at each time step t to update system state vector y.'''
+        '''The sequential solver calls this method at each time step t to update y.'''
         u = y[0]
         v = y[1]
         dudt = v
@@ -33,7 +33,7 @@ class VanDerPolOscillator:
 
         return np.array([dudt, dvdt], dtype=np.float32)
     
-def create_vdpo_dataset(num_nodes, end_time, noise_sd, add_noise=True): 
+def create_vdpo_dataset(num_nodes, end_time, add_noise=True, noise_sd=0.1): 
     '''
     Computes single trajectory of VDPO state over [0, end_time] and splits into 50/50 train set and test set.
     
@@ -41,8 +41,7 @@ def create_vdpo_dataset(num_nodes, end_time, noise_sd, add_noise=True):
     Test grid: chebyshev 2nd kind nodes on [end_time/2, end_time] (for evaluation).
     
     The IVP is solved on the joint (sorted) grid so that train and test trajectories are consistent 
-    (same continuous solution). The differentiation matrix D is computed on the train grid so it matches
-    the collocation points exactly.
+    (same continuous solution). 
     '''
     if num_nodes % 2 != 0 or end_time % 2 != 0:
         raise ValueError("num_nodes and end_time must be even so train/test splits are the same size.")
@@ -55,8 +54,8 @@ def create_vdpo_dataset(num_nodes, end_time, noise_sd, add_noise=True):
     #2. Build train and test grids 
     train_interpol = BarycentricInterpolation(0, half_time, half_nodes)
     test_interpol  = BarycentricInterpolation(half_time, end_time, half_nodes)
-    train_grid = train_interpol.collocation_grid # (half_nodes, )
-    test_grid  = test_interpol.collocation_grid # (half_nodes, )
+    train_grid = train_interpol.colloc_grid # (half_nodes, )
+    test_grid  = test_interpol.colloc_grid # (half_nodes, )
 
     #3. Merge into a single strictly-increasing grid and solve the IVP once
     full_grid = np.unique(np.concatenate([train_grid, test_grid]))  # sorted + deduplicated
