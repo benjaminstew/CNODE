@@ -5,7 +5,7 @@ import numpy as np
 from scipy.integrate import solve_ivp
 import pyomo.environ as pyo
 from pyomo.opt import SolverStatus, TerminationCondition
-from src.direct_collocation import BarycentricInterpolation
+from src.models.direct_collocation import BarycentricInterpolation
 
 class NeuralODEPyomo:
     """
@@ -20,10 +20,10 @@ class NeuralODEPyomo:
             Y_smooth=None, 
             transcription_method='dc',
             rho_reg=None,
-            num_res_eval_nodes=None, 
+            num_res_eval_nodes=None 
     ):
-        self.Y_obs = Y_obs # observed state trajectory from measurements. ndarray (num_nodes, state_dim)
-        self.num_colloc_nodes, self.state_dim = self.Y_obs.shape
+        self.Y_obs = Y_obs # observed state trajectory from measurements. ndarray (num_experiments, num_colloc_nodes, state_dim)
+        self.num_experiments, self.num_colloc_nodes, self.state_dim = self.Y_obs.shape
         if self.state_dim > self.num_colloc_nodes:
             warnings.warn("Y_obs should be structured such that each row represents a new collocation point.")
         self.end_time = end_time
@@ -97,15 +97,21 @@ class NeuralODEPyomo:
     
     def initialise_Y_star(self):
         '''Initialisation of the approximate state trajectory Y_star as a pyomo Var using smooth data.'''
-        def init_rule(model, m, d):
-            return self.Y_smooth[m-1, d-1] # self.Y_smooth is a 0-indexed ndarray
+        if self.Y_smooth is None:
+            def init_rule(model, e, m, d):
+                return self.Y_obs[e-1, m-1, d-1] * np.random.randn() * 0.1 # self.Y_obs is a 0-indexed ndarray
+        else:
+            def init_rule(model, e, m, d):
+                if self.Y_smooth is not None:
+                    return self.Y_smooth[e-1, m-1, d-1] # self.Y_smooth is a 0-indexed ndarray
         return init_rule
     
     def dc_objective_rule(self, model):
         '''Returns the objective function for DC as a pyomo expression.'''
-        # MSE term: (1/N) * ||Y_star - Y_obs||_F^2
-        mse = (1 / self.num_colloc_nodes) * sum(
-            (model.Y_star[n, d] - self.Y_obs[n-1, d-1])**2
+        # MSE term: (1/(E*N)) * sum_e ||Y_star_e - Y_obs_e||_F^2
+        mse = (1 / (self.num_experiments * self.num_colloc_nodes)) * sum(
+            (model.Y_star[e, n, d] - self.Y_obs[e-1, n-1, d-1])**2
+            for e in model.e
             for n in model.n 
             for d in model.d
         ) 
@@ -131,9 +137,10 @@ class NeuralODEPyomo:
         # Regularised MSE term: (1/N) * ||Y_star - Y_obs||_F^2 + lambda * ||theta||_2^2
         reg_mse = self.dc_objective_rule(model) 
 
-        # Residual penalty term: (1 / (2 * rho)) * sum_n(w_m * ||interpolant_m||_2^2) 
+        # Residual penalty term: (1 / (2 * rho)) * sum_e sum_m(w_m * ||interpolant_e_m||_2^2) 
         residual_penalty = (1 / (2 * self.rho_reg)) * sum(
-            self.quadrature_ws[m-1] * (model.ode_lhs_res[m, d] - nn_output_res[m-1, d-1])**2
+            self.quadrature_ws[m-1] * (model.ode_lhs_res[e, m, d] - nn_output_res[e-1, m-1, d-1])**2
+            for e in model.e
             for m in model.m
             for d in model.d
         )
@@ -145,12 +152,14 @@ class NeuralODEPyomo:
         # ------------ SETS ------------
         self.model.l = pyo.RangeSet(len(self.layer_sizes) - 1) # [1:len(self.layer_sizes)-1] as for n layers, have n-1 W matrices/b vectors
         self.model.n = pyo.RangeSet(self.num_colloc_nodes) 
-        self.model.d = pyo.RangeSet(self.state_dim) 
+        self.model.d = pyo.RangeSet(self.state_dim)
+        self.model.e = pyo.RangeSet(self.num_experiments)
         self.model.m = pyo.RangeSet(self.num_res_eval_nodes) if self.transcription_method == 'irrdc' else None
 
         # ----- DECISION VARIABLES -----
         # Initialise approximate state trajectory
         self.model.Y_star = pyo.Var(
+            self.model.e,
             self.model.n, 
             self.model.d, 
             domain=pyo.Reals, 
@@ -179,8 +188,9 @@ class NeuralODEPyomo:
 
         #------ INITIAL CONDITION CONSTRAINT ------
         self.model.initial_condition = pyo.ConstraintList()
-        for d in self.model.d:
-            self.model.initial_condition.add(self.model.Y_star[1, d] == self.Y_obs[0, d-1])
+        for e in self.model.e:
+            for d in self.model.d:
+                self.model.initial_condition.add(self.model.Y_star[e, 1, d] == self.Y_obs[e-1, 0, d-1])
         
         # --------- COLLOCATION CONSTRAINT --------
         # Initialise the collocation-estimated differentiation matrix as a pyomo Param
@@ -193,13 +203,16 @@ class NeuralODEPyomo:
 
         # Define LHS of ODE_colloc (dY_star/dt) as matrix of pyomo expressions 
         self.model.ode_lhs_colloc = pyo.Expression( 
+            self.model.e,
             self.model.n, 
             self.model.d, 
-            rule=lambda model, n, d: sum(self.model.Y_star[j, d] * self.model.D_colloc[n, j] for j in model.n) 
+            rule=lambda model, e, n, d: sum(self.model.Y_star[e, j, d] * self.model.D_colloc[n, j] for j in model.n) 
         )
 
-        # Compute output of NN for collocation points as a ndarray of Pyomo expressions 
-        nn_output_colloc = self.nn_feedforward_pyo(self.model.Y_star, self.num_colloc_nodes) # (num_colloc_nodes, state_dim) ndarray of pyomo expressions
+        # Compute NN output at collocation points per experiment: (num_experiments, num_colloc_nodes, state_dim)
+        nn_output_colloc = np.empty((self.num_experiments, self.num_colloc_nodes, self.state_dim), dtype=object)
+        for experiment in range(1, self.num_experiments + 1):
+            nn_output_colloc[experiment-1] = self.nn_feedforward_pyo(self.model.Y_star, self.num_colloc_nodes, e=experiment)
 
         #----- INTEGRATED RESIDUAL OBJECTIVE -------
         if self.transcription_method == 'irrdc':
@@ -221,20 +234,24 @@ class NeuralODEPyomo:
 
             # Define LHS of ODE_res (dinterpolant/dt) as matrix of pyomo expressions
             self.model.ode_lhs_res = pyo.Expression(
+                self.model.e,
                 self.model.m, 
                 self.model.d, 
-                rule=lambda model, m, d: sum(self.model.D_res[m, j] * self.model.Y_star[j, d] for j in model.n)
+                rule=lambda model, e, m, d: sum(self.model.D_res[m, j] * self.model.Y_star[e, j, d] for j in model.n)
             )
 
             # Define interpolant of Y_star at residual evaluation points as matrix of pyomo expressions 
             self.model.Y_res = pyo.Expression(
+                self.model.e,
                 self.model.m, 
                 self.model.d, 
-                rule=lambda model, m, d: sum(self.model.L_res[m, j] * self.model.Y_star[j, d] for j in model.n)
+                rule=lambda model, e, m, d: sum(self.model.L_res[m, j] * self.model.Y_star[e, j, d] for j in model.n)
             )
 
-            # Compute output of NN at residual evaluation points as a ndarray of Pyomo expressions
-            nn_output_res = self.nn_feedforward_pyo(self.model.Y_res, self.num_res_eval_nodes) # (num_res_eval_nodes, state_dim) ndarray of pyomo expressions
+            # Compute NN output at residual eval points per experiment: (num_experiments, num_res_eval_nodes, state_dim)
+            nn_output_res = np.empty((self.num_experiments, self.num_res_eval_nodes, self.state_dim), dtype=object)
+            for experiment in range(1, self.num_experiments + 1):
+                nn_output_res[experiment-1] = self.nn_feedforward_pyo(self.model.Y_res, self.num_res_eval_nodes, e=experiment)
         
         else:
             nn_output_res = None
@@ -253,20 +270,22 @@ class NeuralODEPyomo:
             self.model.obj = pyo.Objective(rule=lambda m: self.irrdc_objective_rule(m, nn_output_res), sense=pyo.minimize)
 
     def build_constraints(self, nn_output_colloc):
-        # Define ODE equality constraint: dY_star/dt = NN(Y_star)
+        # Define ODE equality constraint: dY_star_e/dt = NN(Y_star_e) for each experiment e
         self.model.ode = pyo.ConstraintList()
-        for n in range(2, self.num_colloc_nodes + 1): # skip n=1 (initial condition already enforced)
-            for d in self.model.d:
-                self.model.ode.add(self.model.ode_lhs_colloc[n, d] == nn_output_colloc[n-1, d-1])
+        for e in range(1, self.num_experiments + 1):
+            for n in range(2, self.num_colloc_nodes + 1): # skip n=1 (initial condition already enforced)
+                for d in self.model.d:
+                    self.model.ode.add(self.model.ode_lhs_colloc[e, n, d] == nn_output_colloc[e-1, n-1, d-1])
 
 
     # ----------------------------------- TRAINING METHODS ----------------------------------- #
     
-    def nn_feedforward_pyo(self, Y, num_nodes): 
+    def nn_feedforward_pyo(self, Y, num_nodes, e=None): 
         '''
-        Compute a feedforward pass of the NN (act func = tanh, linear output layer) 
-        Y is a time invariant pyo Var or ndarray of pyo Expressions.
-        Returns: output layer activations as an ndarray (i, j) of pyo.Expressions (one for each element of Y)
+        Compute a feedforward pass of the NN (act func = tanh, linear output layer).
+        Y is a Pyomo Var indexed (e, n, d) or an ndarray of pyo Expressions indexed (e, n, d).
+        e: experiment index to slice from Y at the input layer.
+        Returns: output layer activations as an ndarray (num_nodes, state_dim) of pyo.Expressions.
         '''
         # Input activations = Y
         activations = [Y]
@@ -279,8 +298,8 @@ class NeuralODEPyomo:
                 # For each node (collocation or residual evaluation)
                 for i in range(1, num_nodes + 1):
                     # Linear output: activations[l-1] . W + b
-                    if l == 1: # if at first hidden layer 
-                        linear_out = sum(activations[l-1][i, d] * self.model.Ws[l].W[d, u] for d in self.model.d) + self.model.bs[l].b[1, u]
+                    if l == 1: # if at first hidden layer — index into Y at experiment e
+                        linear_out = sum(activations[l-1][e, i, d] * self.model.Ws[l].W[d, u] for d in self.model.d) + self.model.bs[l].b[1, u]
                     else:  
                         linear_out = sum(activations[l-1][i-1, k-1] * self.model.Ws[l].W[k, u] for k in range(1, self.layer_sizes[l-1] + 1)) + self.model.bs[l].b[1, u]
                     # Apply activation func: tanh for hidden layers, linear for output layer

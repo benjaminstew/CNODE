@@ -1,6 +1,5 @@
 import numpy as np 
 import pyomo.environ as pyo
-from math import comb
 
 class BarycentricInterpolation:
     """
