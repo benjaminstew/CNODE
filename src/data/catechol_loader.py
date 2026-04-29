@@ -1,6 +1,5 @@
 '''Preparing the catechol single solvent dataset for training and testing. This includes loading the raw data,
-preprocessing it, featurizing the solvent column using spange descriptors, and splitting into train/test sets. 
-I would rather vibe code Pandas commands than learn how to use excel.'''
+preprocessing it, featurizing the solvent column using spange descriptors, and splitting into train/test sets.'''
 
 import pandas as pd 
 from pathlib import Path
@@ -23,7 +22,6 @@ TARGET_LABELS = [
     "Product 3",
     "SOLVENT NAME"
 ]
-
 
 #-------MISC PREPROCESSING FUNCS-------
 def group_by_solvent(data_df: pd.DataFrame) -> pd.DataFrame:
