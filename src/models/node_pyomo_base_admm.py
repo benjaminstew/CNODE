@@ -1,5 +1,4 @@
 # currently lacks customisation on the numerical analysis methods used, interpolation scheme used, ML architecture used, param initialisation methods, etc...
-from pyexpat import model
 import warnings
 import numpy as np 
 import time
@@ -368,7 +367,7 @@ class NODEPyomo:
             solver_options: dictionary of solver options specific to the transcription method used.
         '''
         # set up IPOPT solver
-        solver = pyo.SolverFactory("ipopt", executable="/opt/homebrew/bin/ipopt")
+        solver = pyo.SolverFactory("ipopt", executable="/usr/local/bin/ipopt")
         print("Solver available?: {}".format(solver.available())) 
         #print("\nInitial NN parameter summary stats (pre-IPOPT): ")
         #self.check_param_values()

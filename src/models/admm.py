@@ -2,7 +2,6 @@ from src.models.node_pyomo_base_admm import NODEPyomo
 import numpy as np
 from mpi4py import MPI 
 
-
 class ADMM():
     """
     Acts as top-level interface for training Pyomo-based NODEs with ADMM. Builds and iteracts with the submodels, and implements the ADMM update steps and convergence check.
@@ -13,8 +12,9 @@ class ADMM():
             param_lower_bound, param_upper_bound,
             l2_reg_param, 
             admm_penalty_param, 
-            max_admm_iterations=10,
+            max_admm_iterations=50,
             admm_convergence_tol=1e-2,
+            use_mpi=True, 
             transcription_method='dc',
             residual_reg_param=None,
             num_res_eval_nodes=None
@@ -30,6 +30,7 @@ class ADMM():
         self.param_lower_bound = param_lower_bound
         self.param_upper_bound = param_upper_bound
         self.l2_reg_param = l2_reg_param
+        self.use_mpi = use_mpi
         self.transcription_method = transcription_method
         self.residual_reg_param = residual_reg_param
         self.num_res_eval_nodes = num_res_eval_nodes
@@ -105,13 +106,12 @@ class ADMM():
 
     # ------------------------------ ADMM UPDATE METHODS -------------------------------- #
 
-    def solve_submodels(self, solver_options):
-        '''Paralellise later'''
+    def solve_submodels_sequential(self, solver_options):
         for i in range(self.num_batches):
-            #solve submodel
+            # solve subproblem 
             self.submodels[i].solve_model(solver_options)
 
-            #gather submodel param values
+            # gather updated params from submodel
             for l in range(1, len(self.layer_sizes)):
                 dict_Ws = self.submodels[i].model.Ws[l].W.extract_values()
                 dict_bs = self.submodels[i].model.bs[l].b.extract_values()
@@ -121,6 +121,41 @@ class ADMM():
                 self.submodels_bs[i][l-1] = self.dict_to_ndarray(
                     dict_bs, (1, self.layer_sizes[l])
                 )
+
+    def solve_submodels_parallel(self, solver_options):
+        '''Solve submodels in parallel with MPI and gather parameter updates.'''
+        rank = MPI.COMM_WORLD.Get_rank()
+        size = MPI.COMM_WORLD.Get_size()
+
+        # if only one subproblem, skip MPI
+        if size == 1:
+            self.solve_submodels_sequential(solver_options)
+
+        else:   
+            local_results = []
+            for i in range(rank, self.num_batches, size):
+                # solve subproblem 
+                self.submodels[i].solve_model(solver_options)
+                Ws_layers = []
+                bs_layers = []
+
+                # gather updated params from submodel
+                for l in range(1, len(self.layer_sizes)):
+                    dict_Ws = self.submodels[i].model.Ws[l].W.extract_values()
+                    dict_bs = self.submodels[i].model.bs[l].b.extract_values()
+                    Ws_layers.append(
+                        self.dict_to_ndarray(dict_Ws, (self.layer_sizes[l-1], self.layer_sizes[l]))
+                    )
+                    bs_layers.append(
+                        self.dict_to_ndarray(dict_bs, (1, self.layer_sizes[l]))
+                    )
+                local_results.append((i, Ws_layers, bs_layers))
+
+            gathered = MPI.COMM_WORLD.allgather(local_results)
+            for rank_results in gathered:
+                for i, Ws_layers, bs_layers in rank_results:
+                    self.submodels_Ws[i] = Ws_layers
+                    self.submodels_bs[i] = bs_layers
 
     def update_consensus_params(self): 
         # update consensus params by averaging submodel params
@@ -165,15 +200,24 @@ class ADMM():
         return r_primal
     
     def run_admm_training(self, solver_options):
+        near_tol_count = 0
+        near_tol_lower = 0.5 * self.admm_convergence_tol
+        near_tol_upper = 1.5 * self.admm_convergence_tol
+
         for iteration in range(self.max_admm_iterations):
             print(f"ADMM iteration {iteration+1}")
-            self.solve_submodels(solver_options)
+            if self.use_mpi:
+                self.solve_submodels_parallel(solver_options)
+            else:
+                self.solve_submodels_sequential(solver_options)
             self.update_consensus_params()
             self.update_dual_vars()
             r_primal = self.compute_primal_residual()
             self.iteration_count += 1
             print(f"Primal residual: {r_primal:.6f}")
-            if r_primal < self.admm_convergence_tol:
+            if near_tol_lower <= r_primal <= near_tol_upper:
+                near_tol_count += 1
+            if near_tol_count >= 3 or r_primal < self.admm_convergence_tol:
                 print(f"ADMM converged after {self.iteration_count} iterations!")
                 break
 
@@ -188,7 +232,7 @@ class ADMM():
             method: str='RK45',
             rtol: float= 1e-3,
             atol: float= 1e-6,
-            max_step: float= np.inf,
+            max_step: float= np.inf
     ):
         
         return self.submodels[0].get_predicted_trajectory(
