@@ -3,6 +3,7 @@ from pyexpat import model
 import warnings
 import numpy as np 
 import time
+from pathlib import Path
 from scipy.integrate import solve_ivp
 import pyomo.environ as pyo
 from pyomo.opt import SolverStatus, TerminationCondition
@@ -313,7 +314,7 @@ class NODEPyomo:
             solver_options: dictionary of solver options specific to the transcription method used.
         '''
         # set up IPOPT solver
-        solver = pyo.SolverFactory("ipopt", executable="/opt/homebrew/bin/ipopt")
+        solver = pyo.SolverFactory("ipopt", executable="/usr/local/bin/ipopt")
         print("Solver available?: {}".format(solver.available())) 
         #print("\nInitial NN parameter summary stats (pre-IPOPT): ")
         #self.check_param_values()
@@ -326,6 +327,10 @@ class NODEPyomo:
         solver.options['tol'] = solver_options["tol"] 
         solver.options['acceptable_tol'] = solver_options["acceptable_tol"]
         solver.options['acceptable_iter'] = solver_options["acceptable_iter"]
+        repo_root = Path(__file__).resolve().parents[2]
+        option_path = repo_root / "ipopt.opt"
+        if option_path.exists():
+            solver.options["option_file_name"] = str(option_path)
 
         t0 = time.perf_counter()
         result = solver.solve(self.model, tee=True)

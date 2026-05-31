@@ -1,10 +1,14 @@
+'''DESCRIPTION OF FILE HERE'''
 from src.models.node_pyomo_base_admm import NODEPyomo
 import numpy as np
+from scipy.integrate import solve_ivp
 from mpi4py import MPI 
 
 class ADMM():
     """
-    Acts as top-level interface for training Pyomo-based NODEs with ADMM. Builds and iteracts with the submodels, and implements the ADMM update steps and convergence check.
+    Acts as top-level interface for training Pyomo-based NODEs with ADMM. 
+    Builds and iteracts with the submodels, and implements the ADMM update steps and convergence check.
+    Parallelisation of subproblem solves handled with mpi4py (multiple processes) within this class.
     """
     def __init__(self,
             Y_obs, layer_sizes, end_time, 
@@ -12,8 +16,8 @@ class ADMM():
             param_lower_bound, param_upper_bound,
             l2_reg_param, 
             admm_penalty_param, 
-            max_admm_iterations=50,
-            admm_convergence_tol=1e-2,
+            max_admm_iterations,
+            admm_convergence_tol,
             use_mpi=True, 
             transcription_method='dc',
             residual_reg_param=None,
@@ -50,8 +54,8 @@ class ADMM():
 
         self.iteration_count = 0
 
-    
-    # ----------------------------- MISC METHODS -------------------------------- #
+
+    # ---------------------------- SUBMODEL BUILDING METHODS -------------------------------- #
 
     def dict_to_ndarray(self, dict, shape: tuple):
         arr = np.zeros(shape, dtype=float)
@@ -61,9 +65,6 @@ class ADMM():
 
     def ndarray_to_dict(self, arr):
         return {(i+1, j+1): float(val) for (i, j), val in np.ndenumerate(arr)}
-
-
-    # ---------------------------- SUBMODEL BUILDING METHODS -------------------------------- #
 
     def build_submodels(self):
         submodels = np.empty(self.num_batches, dtype=object)
@@ -158,7 +159,7 @@ class ADMM():
                     self.submodels_bs[i] = bs_layers
 
     def update_consensus_params(self): 
-        # update consensus params by averaging submodel params
+        '''update consensus params by averaging submodel params'''
         self.consensus_Ws = [w.copy() for w in self.submodels_Ws[0]]
         self.consensus_bs = [b.copy() for b in self.submodels_bs[0]]
         for i in range(1, self.num_batches):
@@ -201,7 +202,6 @@ class ADMM():
     
     def run_admm_training(self, solver_options):
         near_tol_count = 0
-        near_tol_lower = 0.5 * self.admm_convergence_tol
         near_tol_upper = 1.5 * self.admm_convergence_tol
 
         for iteration in range(self.max_admm_iterations):
@@ -215,7 +215,7 @@ class ADMM():
             r_primal = self.compute_primal_residual()
             self.iteration_count += 1
             print(f"Primal residual: {r_primal:.6f}")
-            if near_tol_lower <= r_primal <= near_tol_upper:
+            if r_primal <= near_tol_upper:
                 near_tol_count += 1
             if near_tol_count >= 3 or r_primal < self.admm_convergence_tol:
                 print(f"ADMM converged after {self.iteration_count} iterations!")
@@ -227,18 +227,41 @@ class ADMM():
 
     # ---------------------------- PREDICTION METHODS -------------------------------- #
 
-    def get_predicted_trajectory(self, 
-            y_0, t_grid,
-            method: str='RK45',
-            rtol: float= 1e-3,
-            atol: float= 1e-6,
-            max_step: float= np.inf
-    ):
-        
-        return self.submodels[0].get_predicted_trajectory(
-            y_0, t_grid, method=method, rtol=rtol, atol=atol, max_step=max_step
-        )
+    def nn_prediction(self, t, y_0, Ws, bs):
+        y_0 = y_0.reshape(1, -1)
+        out = np.tanh(np.dot(y_0, Ws[0]) + bs[0])
+        for W, b in zip(Ws[1:-1], bs[1:-1]):
+            out = np.tanh(np.dot(out, W) + b)
+        out = np.dot(out, Ws[-1]) + bs[-1]
+        return out.flatten()
 
+    def get_predicted_trajectory(self,
+            y_0, t_grid,
+            method: str = 'RK45',
+            rtol: float = 1e-3,
+            atol: float = 1e-6,
+            max_step: float = np.inf
+    ):
+        '''
+        Predict state trajectory over t_grid via forward integration of the trained NN.
+        Uses consensus parameters directly — call after run_admm_training completes.
+        '''
+        predicted_trajectory = solve_ivp(
+            fun=self.nn_prediction,
+            t_span=(t_grid[0], t_grid[-1]),
+            y0=y_0,
+            t_eval=t_grid,
+            method=method,
+            rtol=rtol,
+            atol=atol,
+            max_step=max_step,
+            args=(self.consensus_Ws, self.consensus_bs)
+        )
+        if not predicted_trajectory.success:
+            raise RuntimeError(
+                f"solve_ivp failed: status={predicted_trajectory.status}, message={predicted_trajectory.message}"
+            )
+        return predicted_trajectory.y.T
 
 
 

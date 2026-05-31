@@ -368,9 +368,8 @@ class NODEPyomo:
         '''
         # set up IPOPT solver
         solver = pyo.SolverFactory("ipopt", executable="/usr/local/bin/ipopt")
+        #solver = pyo.SolverFactory("ipopt", executable="/opt/homebrew/bin/ipopt") 
         print("Solver available?: {}".format(solver.available())) 
-        #print("\nInitial NN parameter summary stats (pre-IPOPT): ")
-        #self.check_param_values()
         
         # set global solver options
         solver.options['max_iter'] = solver_options["max_iter"]
@@ -405,6 +404,10 @@ class NODEPyomo:
 
     
     # ------------------------------ DIAGNOSTIC & MISC METHODS ------------------------------- #
+
+    def pyomo_var_to_numpy(self, pyo_obj, shape): 
+        '''Copy pyo_obj (a Pyomo Var/Param/Expression) into a numpy ndarray.'''
+        return np.array([[pyo.value(pyo_obj[i, j]) for j in range(1, shape[1]+1)] for i in range(1, shape[0]+1)])
     
     def check_param_values(self):
         '''Print summary statistics for NN parameters.'''
@@ -413,86 +416,3 @@ class NODEPyomo:
             b = self.pyomo_var_to_numpy(self.model.bs[l].b, (1, self.layer_sizes[l]))
             print(f"Layer {l}: W range [{W.min():.4f}, {W.max():.4f}], |W| mean {np.abs(W).mean():.4f}")
             print(f"Layer {l}: b range [{b.min():.4f}, {b.max():.4f}], |b| mean {np.abs(b).mean():.4f}")
-
-
-    # ---------------------------- PREDICTION METHODS -------------------------------- #
-
-    def pyomo_var_to_numpy(self, pyo_obj, shape): 
-        '''Copy pyo_obj (a Pyomo Var/Param/Expression) into a numpy ndarray.'''
-        return np.array([[pyo.value(pyo_obj[i, j]) for j in range(1, shape[1]+1)] for i in range(1, shape[0]+1)])
-    
-    def convert_weights(self, Ws):
-        return [self.pyomo_var_to_numpy(Ws[l].W, (self.layer_sizes[l-1], self.layer_sizes[l])) for l in self.model.l]
-    
-    def convert_biases(self, bs):
-        return [self.pyomo_var_to_numpy(bs[l].b, (1, self.layer_sizes[l])) for l in self.model.l]
-
-    def nn_prediction(self, t, y_0, Ws, bs): 
-        y_0 = y_0.reshape(1, -1) # reshape to row vector
-        out = np.tanh(np.dot(y_0, Ws[0]) + bs[0]) # first hidden layer
-        for W, b in zip(Ws[1:-1], bs[1:-1]): 
-            out = np.tanh(np.dot(out, W) + b) # calc activation for hidden layer, move forward
-        out = np.dot(out, Ws[-1]) + bs[-1] # linear output layer
-        
-        return out.flatten() # return 1D array for solve_ivp
-
-    def get_predicted_trajectory(self, 
-            y_0, t_grid,
-            method: str='RK45',
-            rtol: float= 1e-3,
-            atol: float= 1e-6,
-            max_step: float= np.inf,
-    ):
-        '''
-        Predict state trajectory over t_grid via forward integration of the trained NN using scipy.solve_ivp.
-
-        Args:
-            y_0: Initial state, ndarray (state_dim,). Must be 1D for scipy.solve_ivp.
-            t_grid: Strictly increasing time grid, ndarray (num_nodes, ).
-            method: solve_ivp method (e.g. 'RK45', 'DOP853', 'Radau', 'BDF').
-            rtol, atol, max_step: solve_ivp tolerances/step control.
-
-        Returns:
-            Predicted state trajectory as ndarray (num_nodes, state_dim).
-        '''
-        if t_grid.ndim != 1 or t_grid.size < 2:
-            raise ValueError(f"t_grid must be a 1D array with >=2 points; got shape {t_grid.shape}.")
-        if not np.all(np.isfinite(t_grid)):
-            raise ValueError("t_grid must contain only finite values.")
-        if np.any(np.diff(t_grid) <= 0):
-            raise ValueError("t_grid must be strictly increasing (solve_ivp expects monotone time).")
-
-        if y_0.ndim != 1:
-            raise ValueError(f"y_0 must be 1D; got shape {y_0.shape}.")
-        if hasattr(self, 'state_dim') and y_0.shape[0] != self.state_dim:
-            raise ValueError(f"y_0 has length {y_0.shape[0]} but state_dim is {self.state_dim}.")
-        if not np.all(np.isfinite(y_0)):
-            raise ValueError("y_0 must contain only finite values.")
-        
-        if self.admm_submodel:
-            print("Using consensus parameters for prediction.")
-            Ws = self.convert_weights(self.model.consensus_Ws)
-            bs = self.convert_biases(self.model.consensus_bs)
-        else:
-            Ws = self.convert_weights(self.model.Ws)
-            bs = self.convert_biases(self.model.bs)
-
-        predicted_trajectory = solve_ivp(
-            fun=self.nn_prediction,
-            t_span=(t_grid[0], t_grid[-1]),
-            y0=y_0,
-            t_eval=t_grid,
-            method=method,
-            rtol=rtol,
-            atol=atol,
-            max_step=max_step,
-            args=(Ws, bs)
-        )
-        
-        if not predicted_trajectory.success:
-            raise RuntimeError("solve_ivp failed: " f"status={predicted_trajectory.status}, message={predicted_trajectory.message}")
-
-        return predicted_trajectory.y.T
-
-
-

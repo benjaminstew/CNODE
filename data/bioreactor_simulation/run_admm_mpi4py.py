@@ -1,6 +1,6 @@
 """
 Run ADMM training for the synthetic bioreactor dataset with MPI parallelisation.
-Run from repo root with 'mpiexec -n num_batches python results.bioreactor_admm_mpi_script'
+Run from repo root with 'mpiexec -n num_batches python results.bioreactor_admm_script'
 """
 import time
 from pathlib import Path
@@ -8,18 +8,24 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from mpi4py import MPI
-from src.models.admm import ADMM
+from src.models.admm_mpi4py import ADMM
 
 def main():
     rank = MPI.COMM_WORLD.Get_rank()
 
     # import training data
-    data_path = "./data/bioreactor_sim_by_noise/noise_level_01_eps0.01.csv"
+    data_path = "./data/bioreactor_simulation/noise_level_01_eps0.01.csv"
     state_cols = ['G', 'O', 'X', 'Xd', 'P', 'L', 'CO2']
     state_dim = len(state_cols)
+
     layer_sizes = [state_dim, 16, state_dim]
-    train_batch_ids = [5, 25, 45]
-    test_batch_ids = [6, 16, 26]
+
+    # split train and test batch ids
+    all_batch_ids = np.arange(0, 50)
+    train_batch_ids = np.random.choice(all_batch_ids, size=5, replace=False).tolist()
+    remaining_batch_ids = np.setdiff1d(all_batch_ids, train_batch_ids)
+    test_batch_ids = sorted(np.random.choice(remaining_batch_ids, size=3, replace=False).tolist())
+
     df = pd.read_csv(data_path)
     train_batches = {
         batch_id: df[df['Batch'] == f"Batch_{batch_id}"].reset_index(drop=True)
@@ -49,8 +55,8 @@ def main():
         "print_level": 5,
         "nlp_scaling_method": "gradient-based",
         "mu_strategy": "adaptive",
-        "tol": 1e-5,
-        "acceptable_tol": 1e-4,
+        "tol": 1e-6,
+        "acceptable_tol": 1e-5,
         "acceptable_iter": 10,
     }
 
@@ -64,9 +70,9 @@ def main():
         param_lower_bound=-100,
         param_upper_bound=100,
         l2_reg_param=1e-4,
-        admm_penalty_param=1,
+        admm_penalty_param=1, 
         max_admm_iterations=1000,
-        admm_convergence_tol=5e-4,
+        admm_convergence_tol=0.15,
         use_mpi=True,
         transcription_method='dc'
     )
@@ -83,20 +89,21 @@ def main():
         param_lower_bound=-100,
         param_upper_bound=100,
         l2_reg_param=1e-4,
-        admm_penalty_param=1,
+        admm_penalty_param=10,
         max_admm_iterations=500,
-        admm_convergence_tol=5e-2,
+        admm_convergence_tol=0.1,
         use_mpi=True,
         transcription_method='irrdc',
-        residual_reg_param=1,
-        num_res_eval_nodes=25
+        residual_reg_param=0.5,
+        num_res_eval_nodes=50
     )
     t0 = time.perf_counter()
     admm.run_admm_training(solver_options)
 
+    print(f"ADMM training time: {time.perf_counter() - t0:.1f}s")
+
     # plot trajectories 
     if rank == 0:
-        print(f"ADMM training time: {time.perf_counter() - t0:.1f}s")
         dt = train_grid[1] - train_grid[0]
         predicted_train = {}
         for batch_id in train_batch_ids:
@@ -141,7 +148,7 @@ def main():
         fig.legend(handles, labels, fontsize=8, loc='lower right', bbox_to_anchor=(0.98, 0.02))
         plt.suptitle(f'Predicted vs Observed Trajectories (Training Batches; {admm.transcription_method})', fontsize=14)
         plt.tight_layout()
-        output_path = Path(__file__).with_name(f"{admm.transcription_method}_run4_train.png")
+        output_path = Path(__file__).with_name(f"{admm.transcription_method}_run10_train.png")
         fig.savefig(output_path, dpi=200, bbox_inches="tight")
         plt.show()
 
@@ -175,7 +182,7 @@ def main():
         fig.legend(handles, labels, fontsize=8, loc='lower right', bbox_to_anchor=(0.98, 0.02))
         plt.suptitle(f'Predicted vs Observed Trajectories (Test Batches; {admm.transcription_method})', fontsize=14)
         plt.tight_layout()
-        output_path = Path(__file__).with_name(f"{admm.transcription_method}_run4_test.png")
+        output_path = Path(__file__).with_name(f"{admm.transcription_method}_run10_test.png")
         fig.savefig(output_path, dpi=200, bbox_inches="tight")
         plt.show()
 
