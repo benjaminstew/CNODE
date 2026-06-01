@@ -1,8 +1,0 @@
-# This is a comment: Point to the HSL shared library
-hsllib /Users/bms125/Desktop/Projects/PhD/libHSL/lib/libhsl.dylib
-
-# Tell Ipopt which HSL solver to use
-linear_solver ma57
-
-# Optional: Adjust print level for debugging
-print_level 5
