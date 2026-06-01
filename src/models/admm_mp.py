@@ -71,12 +71,17 @@ class MPWorker:
     def broadcast_consensus_and_duals(self,
             consensus_Ws: list, consensus_bs: list,
             dual_var_Ws: list, dual_var_bs: list
-    ):
+    ):  
         for l in range(1, len(self.layer_sizes)):
             self.submodel.model.consensus_Ws[l].W.store_values(self.ndarray_to_dict(consensus_Ws[l-1]))
             self.submodel.model.consensus_bs[l].b.store_values(self.ndarray_to_dict(consensus_bs[l-1]))
             self.submodel.model.dual_var_Ws[l].W.store_values(self.ndarray_to_dict(dual_var_Ws[l-1]))
             self.submodel.model.dual_var_bs[l].b.store_values(self.ndarray_to_dict(dual_var_bs[l-1]))
+
+            # warm start submodel from consensus params (to help convergence)
+            self.submodel.model.Ws[l].W.set_values(self.ndarray_to_dict(consensus_Ws[l-1]))
+            self.submodel.model.bs[l].b.set_values(self.ndarray_to_dict(consensus_bs[l-1]))
+
 
 class PoolManager:
     """
@@ -116,6 +121,7 @@ class PoolManager:
             finally:
                 self.pool = None
             print("Closed multiprocessing pool.")
+
 
 class ADMM:
     """
@@ -251,7 +257,9 @@ class ADMM:
                 r_primal += np.linalg.norm(self.submodels_Ws[i][l] - self.consensus_Ws[l])
                 r_primal += np.linalg.norm(self.submodels_bs[i][l] - self.consensus_bs[l])
         return r_primal
-    
+
+    #def compute_dual_residual(self):
+
 
     #----------------- MAIN ADMM LOOP -------------------
 

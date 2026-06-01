@@ -76,7 +76,7 @@ class NODEPyomo:
         def init_rule(model, i, j):
             return W[i-1, j-1] # W is a 0-indexed ndarray 
         return init_rule
-
+    
     def initialise_bias(self, shape):
         '''Normal random initialisation of a bias vector as pyomo Var'''
         b = np.random.randn(*shape) * 0.1
@@ -367,9 +367,10 @@ class NODEPyomo:
             solver_options: dictionary of solver options specific to the transcription method used.
         '''
         # set up IPOPT solver
-        solver = pyo.SolverFactory("ipopt", executable="/usr/local/bin/ipopt")
+        solver = pyo.SolverFactory("ipopt", executable="/rds/general/user/bms125/home/miniforge3/envs/cnode/bin/ipopt") # HPC
+        #solver = pyo.SolverFactory("ipopt", executable="/usr/local/bin/ipopt")
         #solver = pyo.SolverFactory("ipopt", executable="/opt/homebrew/bin/ipopt") 
-        print("Solver available?: {}".format(solver.available())) 
+        #print("Solver available?: {}".format(solver.available())) 
         
         # set global solver options
         solver.options['max_iter'] = solver_options["max_iter"]
@@ -381,7 +382,7 @@ class NODEPyomo:
         solver.options['acceptable_iter'] = solver_options["acceptable_iter"]
 
         t0 = time.perf_counter()
-        result = solver.solve(self.model, tee=True)
+        result = solver.solve(self.model, tee=False)
         solve_wall_time = time.perf_counter() - t0
 
         iterations = getattr(result.solver, "iterations", None)
@@ -395,8 +396,9 @@ class NODEPyomo:
         if result.solver.status == SolverStatus.ok and (result.solver.termination_condition == TerminationCondition.optimal):
             if not self.admm_submodel:
                 self.freeze_vars()
-                print("NN parameters have been frozen")
-            print("Solution is feasible and optimal\n\n")
+                print("Solve time {:.1f}s for {} iterations".format(solve_wall_time, iterations))
+                #print("NN parameters have been frozen")
+            #print("Solution is feasible and optimal\n\n")
             #print("\nFinal NN parameter summary stats (post-IPOPT): ")
             #self.check_param_values()
         else:
