@@ -1,25 +1,43 @@
 from src.models.node_pyomo_base_admm import NODEPyomo
 import numpy as np
+import time
+import threading
 import multiprocessing as mp
 from scipy.integrate import solve_ivp
 
 # ---- MODULE LEVEL FUNCTIONS (required for mp.Pool pickling) ----
-WORKER = None # child processes (independent memory) each have own WORKER instance 
+WORKER = None   # child processes (independent memory) each have own WORKER instance
+BARRIER = None  # shared barrier enforcing a strict 1:1 task->worker mapping per round
 
-def init_worker(id_queue: mp.Queue, submodel_config: dict):
-    global WORKER
+def init_worker(id_queue: mp.Queue, submodel_config: dict, barrier):
+    global WORKER, BARRIER
     worker_id = id_queue.get() # = submodel index, per order of worker process creation
     WORKER = MPWorker(worker_id, submodel_config)
+    BARRIER = barrier
 
 def solve_worker(payload: dict):
-    WORKER.broadcast_consensus_and_duals(
-        payload["consensus_Ws"],
-        payload["consensus_bs"],
-        payload["dual_var_Ws"][WORKER.worker_id],
-        payload["dual_var_bs"][WORKER.worker_id]
-    )
-    WORKER.solve_submodel(payload["solver_options"])
-    return (WORKER.worker_id, WORKER.submodel_Ws, WORKER.submodel_bs)
+    try:
+        WORKER.broadcast_consensus_and_duals(
+            payload["consensus_Ws"],
+            payload["consensus_bs"],
+            payload["dual_var_Ws"][WORKER.worker_id],
+            payload["dual_var_bs"][WORKER.worker_id],
+            payload["iteration_count"]
+        )
+        WORKER.solve_submodel(payload["solver_options"])
+        return (WORKER.worker_id, WORKER.submodel_Ws, WORKER.submodel_bs)
+    finally:
+        # Block here until ALL workers have finished their one task. A worker cannot
+        # return (and therefore cannot pull a second task from the pool queue) until
+        # every worker is at the barrier — guaranteeing each of the N tasks lands on a
+        # distinct worker, i.e. a strict 1:1 mapping of batch -> worker each round.
+        # In finally so a failed solve still releases the barrier (no deadlock); the
+        # exception then still propagates to the main process via pool.map.
+        if BARRIER is not None:
+            try:
+                BARRIER.wait()
+            except threading.BrokenBarrierError:
+                pass
 
 
 class MPWorker:
@@ -70,7 +88,8 @@ class MPWorker:
 
     def broadcast_consensus_and_duals(self,
             consensus_Ws: list, consensus_bs: list,
-            dual_var_Ws: list, dual_var_bs: list
+            dual_var_Ws: list, dual_var_bs: list, 
+            iteration_count: int
     ):  
         for l in range(1, len(self.layer_sizes)):
             self.submodel.model.consensus_Ws[l].W.store_values(self.ndarray_to_dict(consensus_Ws[l-1]))
@@ -79,8 +98,10 @@ class MPWorker:
             self.submodel.model.dual_var_bs[l].b.store_values(self.ndarray_to_dict(dual_var_bs[l-1]))
 
             # warm start submodel from consensus params (to help convergence)
-            self.submodel.model.Ws[l].W.set_values(self.ndarray_to_dict(consensus_Ws[l-1]))
-            self.submodel.model.bs[l].b.set_values(self.ndarray_to_dict(consensus_bs[l-1]))
+            if iteration_count > 0: 
+                self.submodel.model.Ws[l].W.set_values(self.ndarray_to_dict(consensus_Ws[l-1]))
+                self.submodel.model.bs[l].b.set_values(self.ndarray_to_dict(consensus_bs[l-1]))
+                #print(f"\nWORKER {self.worker_id}: WARM START FROM CONSENSUS PARAMS FOR LAYER {l}.\n")
 
 
 class PoolManager:
@@ -98,15 +119,18 @@ class PoolManager:
         id_queue = ctx.Queue()
         for i in range(self.num_batches):
             id_queue.put(i)
+        # Barrier spanning all workers; used in solve_worker to force a 1:1
+        # task->worker mapping each round (see solve_worker for rationale).
+        barrier = ctx.Barrier(self.num_batches)
         pool = ctx.Pool(
             processes=self.num_batches,
             initializer=init_worker,
-            initargs=(id_queue, submodel_config)
+            initargs=(id_queue, submodel_config, barrier)
         )
         print(f"Opened multiprocessing pool with {self.num_batches} workers.")
         return pool
 
-    def map(self, payload: dict) -> list:
+    def map(self, payload: dict) -> list[tuple]:
         '''Dispatch payload to all workers; return list of (worker_id, submodel_Ws, submodel_bs).'''
         return self.pool.map(solve_worker, [payload] * self.num_batches, chunksize=1)
 
@@ -136,7 +160,8 @@ class ADMM:
             l2_reg_param,
             admm_penalty_param,
             max_admm_iterations,
-            admm_convergence_tol,
+            admm_primal_residual_tol=None,
+            admm_train_mse_tol=None, 
             use_pool=False,
             transcription_method='dc',
             residual_reg_param=None,
@@ -153,7 +178,8 @@ class ADMM:
         self.l2_reg_param = l2_reg_param
         self.admm_penalty_param = admm_penalty_param
         self.max_admm_iterations = max_admm_iterations
-        self.admm_convergence_tol = admm_convergence_tol
+        self.admm_primal_residual_tol = admm_primal_residual_tol
+        self.admm_train_mse_tol = admm_train_mse_tol
         self.use_pool = use_pool
         self.transcription_method = transcription_method
         self.residual_reg_param = residual_reg_param
@@ -181,14 +207,20 @@ class ADMM:
             self.workers = [MPWorker(i, submodel_config) for i in range(self.num_batches)] 
             self.pool_manager = None
 
-        self.dual_var_Ws, self.dual_var_bs = self._zero_initialise_dual_vars()
+        self.dual_var_Ws, self.dual_var_bs = self.zero_initialise_dual_vars()
         self.submodels_Ws = [[0 for _ in range(len(layer_sizes) - 1)] for _ in range(self.num_batches)]
         self.submodels_bs = [[0 for _ in range(len(layer_sizes) - 1)] for _ in range(self.num_batches)]
         self.consensus_Ws = [np.zeros((layer_sizes[l], layer_sizes[l+1])) for l in range(len(layer_sizes) - 1)]
         self.consensus_bs = [np.zeros((1, layer_sizes[l+1])) for l in range(len(layer_sizes) - 1)]
         self.iteration_count = 0
 
-    def _zero_initialise_dual_vars(self):
+        self.mse_history = {
+            "time_min": [],
+            "train_mse": [], "train_mse_std": [],
+            "test_mse": [], "test_mse_std": [],
+        }
+
+    def zero_initialise_dual_vars(self):
         dual_var_Ws = [
             [np.zeros((self.layer_sizes[l], self.layer_sizes[l+1])) for l in range(len(self.layer_sizes) - 1)]
             for _ in range(self.num_batches)
@@ -218,7 +250,8 @@ class ADMM:
             "consensus_bs": self.consensus_bs,
             "dual_var_Ws": self.dual_var_Ws,
             "dual_var_bs": self.dual_var_bs,
-            "solver_options": solver_options,
+            "solver_options": solver_options, 
+            "iteration_count": self.iteration_count
         }
         results = self.pool_manager.map(payload)
         for worker_id, submodel_Ws, submodel_bs in results:
@@ -261,12 +294,41 @@ class ADMM:
     #def compute_dual_residual(self):
 
 
+    #----------------- WALL-CLOCK CONVERGENCE TRACKING -------------------
+
+    def compute_prediction_mse(self,
+            Y_obs, t_grid,
+            method: str = 'RK45',
+            rtol: float = 1e-3,
+            atol: float = 1e-6,
+            max_step: float = np.inf
+    ):
+        '''
+        MSE between observed trajectories and trajectories predicted
+        with the current consensus parameters. The MSE is computed per batch, then
+        the mean and std across batches are returned.
+        '''
+        per_batch_mse = []
+        for b in range(Y_obs.shape[0]):
+            y0 = Y_obs[b, 0, :]
+            try:
+                pred = self.get_predicted_trajectory(
+                    y0, t_grid, method=method, rtol=rtol, atol=atol, max_step=max_step
+                )
+            except RuntimeError:
+                return np.nan, np.nan # unstable params early in training => skip point
+            per_batch_mse.append(np.mean((pred - Y_obs[b]) ** 2))
+        if not per_batch_mse:
+            return np.nan, np.nan
+        
+        return float(np.mean(per_batch_mse)), float(np.std(per_batch_mse))
+
+
     #----------------- MAIN ADMM LOOP -------------------
 
-    def run_admm_training(self, solver_options: dict):
-        near_tol_count = 0
-        near_tol_upper = 1.5 * self.admm_convergence_tol
-
+    # I can make this simpler 
+    def run_admm_training(self, solver_options: dict, mse_eval_options: dict = None):
+        t_start = time.perf_counter()
         try:
             for iteration in range(self.max_admm_iterations):
                 print(f"ADMM iteration {iteration + 1}")
@@ -279,13 +341,51 @@ class ADMM:
                 r_primal = self.compute_primal_residual()
                 self.iteration_count += 1
                 print(f"Primal residual: {r_primal:.6f}")
-                if r_primal <= near_tol_upper:
-                    near_tol_count += 1
-                if near_tol_count >= 3 or r_primal < self.admm_convergence_tol:
-                    print(f"ADMM converged after {self.iteration_count} iterations!")
-                    break
+
+                # Record wall-clock convergence (prediction MSE) using the current consensus model
+                # Timer is paused for evaluation
+                if mse_eval_options is not None:
+                    t_eval0 = time.perf_counter()
+                    pred_kw = {
+                        "method": mse_eval_options.get("method", "RK45"),
+                        "rtol": mse_eval_options.get("rtol", 1e-3),
+                        "atol": mse_eval_options.get("atol", 1e-6),
+                        "max_step": mse_eval_options.get("max_step", np.inf),
+                    }
+                    train_mse, train_std = self.compute_prediction_mse(
+                        mse_eval_options["Y_obs"], mse_eval_options["train_grid"], **pred_kw
+                    )
+                    test_mse, test_std = self.compute_prediction_mse(
+                        mse_eval_options["Y_test_obs"], mse_eval_options["test_grid"], **pred_kw
+                    )
+                    elapsed_min = (time.perf_counter() - t_start) / 60.0
+                    self.mse_history["time_min"].append(elapsed_min)
+                    self.mse_history["train_mse"].append(train_mse)
+                    self.mse_history["train_mse_std"].append(train_std)
+                    self.mse_history["test_mse"].append(test_mse)
+                    self.mse_history["test_mse_std"].append(test_std)
+                    print(f"Train MSE: {train_mse:.6e} | Test MSE: {test_mse:.6e}")
+                    t_start += time.perf_counter() - t_eval0  # exclude eval cost from timer
+
+                # check ADMM convergence based on primal residual or train MSE or both 
+                if self.admm_primal_residual_tol is not None:  
+                    if self.admm_train_mse_tol is not None:
+                        if r_primal <= self.admm_primal_residual_tol and train_mse <= self.admm_train_mse_tol:
+                            print(f"ADMM converged (wrt primal residual and train MSE) after {self.iteration_count} iterations!")
+                            break        
+                    elif r_primal <= self.admm_primal_residual_tol:
+                        print(f"ADMM converged (wrt primal residual)after {self.iteration_count} iterations!")
+                        break
+                elif self.admm_train_mse_tol is not None:
+                    if train_mse <= self.admm_train_mse_tol:
+                        print(f"ADMM converged (wrt train MSE) after {self.iteration_count} iterations!")
+                        break
+                else:
+                    raise ValueError("NO ADMM CONVERGENCE CRITERIA SPECIFIED.")
+
             if self.iteration_count >= self.max_admm_iterations:
                 print("Max ADMM iterations reached.")
+        
         finally:
             if self.use_pool:
                 self.pool_manager.close()
@@ -309,8 +409,7 @@ class ADMM:
             max_step: float = np.inf
     ):
         '''
-        Predict state trajectory over t_grid via forward integration of the trained NN.
-        Uses consensus parameters directly — call after run_admm_training completes.
+        Predict state trajectory over t_grid via forward integration of the consenus model.
         '''
         predicted_trajectory = solve_ivp(
             fun=self.nn_prediction,

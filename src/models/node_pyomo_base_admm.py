@@ -143,7 +143,6 @@ class NODEPyomo:
                 for l in model.l
                 for j in range(1, self.layer_sizes[l] + 1)
             ))
-
             return mse + reg_l2_norm + consensus_penalty
 
         return mse + reg_l2_norm
@@ -367,9 +366,9 @@ class NODEPyomo:
             solver_options: dictionary of solver options specific to the transcription method used.
         '''
         # set up IPOPT solver
-        solver = pyo.SolverFactory("ipopt", executable="/rds/general/user/bms125/home/miniforge3/envs/cnode/bin/ipopt") # HPC
+        #solver = pyo.SolverFactory("ipopt", executable="/rds/general/user/bms125/home/miniforge3/envs/cnode/bin/ipopt") # HPC
         #solver = pyo.SolverFactory("ipopt", executable="/usr/local/bin/ipopt")
-        #solver = pyo.SolverFactory("ipopt", executable="/opt/homebrew/bin/ipopt") 
+        solver = pyo.SolverFactory("ipopt", executable="/opt/homebrew/bin/ipopt") 
         #print("Solver available?: {}".format(solver.available())) 
         
         # set global solver options
@@ -382,7 +381,7 @@ class NODEPyomo:
         solver.options['acceptable_iter'] = solver_options["acceptable_iter"]
 
         t0 = time.perf_counter()
-        result = solver.solve(self.model, tee=False)
+        result = solver.solve(self.model, tee=True)
         solve_wall_time = time.perf_counter() - t0
 
         iterations = getattr(result.solver, "iterations", None)
@@ -396,7 +395,7 @@ class NODEPyomo:
         if result.solver.status == SolverStatus.ok and (result.solver.termination_condition == TerminationCondition.optimal):
             if not self.admm_submodel:
                 self.freeze_vars()
-                print("Solve time {:.1f}s for {} iterations".format(solve_wall_time, iterations))
+                print("\nSolve time {:.1f}s for {} iterations\n".format(solve_wall_time, iterations))
                 #print("NN parameters have been frozen")
             #print("Solution is feasible and optimal\n\n")
             #print("\nFinal NN parameter summary stats (post-IPOPT): ")
